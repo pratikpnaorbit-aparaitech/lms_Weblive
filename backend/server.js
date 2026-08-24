@@ -103,7 +103,25 @@ if (MONGODB_URI) {
     .catch(err => console.error("⚠️ MongoDB Atlas connection notice:", err.message));
 }
 
-app.use(cors());
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:5000",
+  "http://127.0.0.1:5000",
+  "https://weblive-qvzp.onrender.com"
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true
+}));
 app.use(express.json({limit:"12mb"}));
 app.use(express.static(path.join(__dirname, "../frontend")));
 
@@ -1737,6 +1755,20 @@ app.get("/api/admin/projects/:projectId/submissions/:studentId/zip", leaderAuth,
   res.download(filePath, p.zipOriginalName);
 });
 
+function validateAndNormalizeGithubUrl(url) {
+  if (typeof url !== "string") return null;
+  let cleanUrl = url.trim();
+  cleanUrl = cleanUrl.replace(/\/+$/, "");
+  if (cleanUrl.toLowerCase().endsWith(".git")) {
+    cleanUrl = cleanUrl.slice(0, -4);
+  }
+  const regex = /^https?:\/\/(www\.)?github\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/i;
+  if (!regex.test(cleanUrl)) {
+    return null;
+  }
+  return cleanUrl;
+}
+
 app.post("/api/projects/:id/submit", auth, (req, res) => {
   upload.single("projectZip")(req, res, async (err) => {
     if (err) {
@@ -1744,7 +1776,8 @@ app.post("/api/projects/:id/submit", auth, (req, res) => {
     }
     
     const { githubUrl, submissionNote = "" } = req.body || {};
-    if (!/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+(\/.*)?$/i.test(githubUrl || "")) {
+    const normalizedUrl = validateAndNormalizeGithubUrl(githubUrl || "");
+    if (!normalizedUrl) {
       if (req.file) {
         fs.unlinkSync(req.file.path);
       }
@@ -1790,7 +1823,7 @@ app.post("/api/projects/:id/submit", auth, (req, res) => {
       return res.status(400).json({ message: "Pass the quiz before submission." });
     }
     
-    p.githubUrl = githubUrl;
+    p.githubUrl = normalizedUrl;
     p.submissionNote = submissionNote.trim();
     p.submittedAt = new Date().toISOString();
     p.status = "completed";
