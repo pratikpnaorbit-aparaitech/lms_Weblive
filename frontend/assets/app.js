@@ -1,7 +1,9 @@
 
 "use strict";
 
-const API = "https://weblive-qvzp.onrender.com/api";
+const API = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+  ? (window.location.port === "5000" ? "/api" : "http://localhost:5000/api")
+  : "/api";
 const $ = id => document.getElementById(id);
 const state = {
   token: localStorage.getItem("aprToken") || "",
@@ -20,25 +22,144 @@ const state = {
 
 let adminStudentsCache = [];
 
-async function api(path, options = {}) {
-  let response;
+async function request(path, options = {}, isLeader = false) {
+  const maxRetries = 5;
+  const retryDelay = 5000;
+  const timeoutMs = 60000;
+  let attempt = 0;
+
+  while (true) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    const start = Date.now();
+    const fullUrl = API.startsWith("/") ? (window.location.origin + API + path) : (API + path);
+    const method = options.method || "GET";
+    let response;
+
     try {
-    const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
-    response = await fetch(API + path, {
-      ...options,
-      headers: {
+      const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
+      const headers = {
         ...(isFormData ? {} : { "Content-Type": "application/json" }),
-        ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}),
+        ...(isLeader 
+          ? ((state.leaderToken || state.token) ? { Authorization: `Bearer ${state.leaderToken || state.token}` } : {})
+          : (state.token ? { Authorization: `Bearer ${state.token}` } : {})),
         ...(options.headers || {})
+      };
+
+      response = await fetch(API + path, {
+        ...options,
+        signal: controller.signal,
+        headers
+      });
+    } catch (err) {
+      clearTimeout(id);
+      const duration = Date.now() - start;
+      const isTimeout = err.name === "AbortError";
+      const errorType = isTimeout ? "Timeout" : "NetworkError";
+
+      // Logging for login requests
+      if (path.includes("/auth/login") || path.includes("/auth/student-login") || path.includes("/auth/leader-login")) {
+        console.log(
+          `[LOGIN DEBUG]\n` +
+          `API Base URL: ${API}\n` +
+          `Login Endpoint: ${path}\n` +
+          `Full Request URL: ${fullUrl}\n` +
+          `HTTP Method: ${method}\n` +
+          `Request Started: ${new Date(start).toISOString()}\n` +
+          `Response Received: ${new Date().toISOString()}\n` +
+          `HTTP Status: ${isTimeout ? "Timeout" : "Network Error"}\n` +
+          `Response Body: -\n` +
+          `Request Duration: ${duration}ms\n` +
+          `Error Type: ${errorType} - ${err.message}`
+        );
       }
-    });
-  } catch {
-    const isLocal = API.includes("localhost") || API.includes("127.0.0.1");
-    throw new Error(isLocal ? "Backend is offline. Run backend using npm start." : "Connection failed. Hosted backend is starting up or unreachable. Please try again in a few seconds.");
+
+      if (!isTimeout && attempt < maxRetries) {
+        attempt++;
+        console.warn(`[API] Network error. Retrying in ${retryDelay/1000}s... (Attempt ${attempt}/${maxRetries})`);
+        updateLoginStatusUI(`Waking up server... (Attempt ${attempt}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue;
+      }
+
+      if (isTimeout) {
+        throw new Error("Backend timeout: The server took too long to respond.");
+      }
+      throw new Error(`Connection failed. ${err.message || "Network issue."}`);
+    }
+
+    // Process Response (Not wrapped in general network try-catch block)
+    clearTimeout(id);
+    const duration = Date.now() - start;
+
+    let responseBodyText = "";
+    let data = {};
+    try {
+      responseBodyText = await response.clone().text();
+      data = JSON.parse(responseBodyText);
+    } catch (e) {
+      responseBodyText = "Non-JSON response";
+    }
+
+    // Logging for login requests
+    if (path.includes("/auth/login") || path.includes("/auth/student-login") || path.includes("/auth/leader-login")) {
+      console.log(
+        `[LOGIN DEBUG]\n` +
+        `API Base URL: ${API}\n` +
+        `Login Endpoint: ${path}\n` +
+        `Full Request URL: ${fullUrl}\n` +
+        `HTTP Method: ${method}\n` +
+        `Request Started: ${new Date(start).toISOString()}\n` +
+        `Response Received: ${new Date().toISOString()}\n` +
+        `HTTP Status: ${response.status}\n` +
+        `Response Body: ${responseBodyText}\n` +
+        `Request Duration: ${duration}ms`
+      );
+    }
+
+    if (response.ok) {
+      return data;
+    }
+
+    // Handle 502/503/504 retry logic for sleeping server
+    if (response.status === 502 || response.status === 503 || response.status === 504) {
+      if (attempt < maxRetries) {
+        attempt++;
+        console.warn(`[API] Temporary server error ${response.status}. Retrying in ${retryDelay/1000}s... (Attempt ${attempt}/${maxRetries})`);
+        updateLoginStatusUI(`Waking up server... (Attempt ${attempt}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue;
+      }
+      throw new Error(`Hosted backend is starting up or unreachable (HTTP ${response.status}). Please try again in a few seconds.`);
+    }
+
+    // Handle standard business errors (400, 401, 403, 404, 500)
+    if (response.status === 401) {
+      throw new Error(data.message || "Invalid credentials.");
+    }
+    if (response.status === 403) {
+      throw new Error("Access denied (403 Forbidden).");
+    }
+    if (response.status === 404) {
+      throw new Error("API endpoint configuration problem (404 Not Found).");
+    }
+    if (response.status === 500) {
+      throw new Error(data.message || "Internal Server Error (500).");
+    }
+
+    throw new Error(data.message || `Request failed with status ${response.status}`);
   }
-  const data = await response.json().catch(() => ({ message: "Invalid server response." }));
-  if (!response.ok) throw new Error(data.message || "Request failed.");
-  return data;
+}
+
+function updateLoginStatusUI(msg) {
+  const btn = document.getElementById("mainLoginButton");
+  if (btn) {
+    btn.textContent = msg;
+  }
+}
+
+async function api(path, options = {}) {
+  return request(path, options, false);
 }
 
 function notify(message, type = "success") {
@@ -145,6 +266,14 @@ async function unifiedLogin() {
     return notify("Invalid Email/Password.", "error");
   }
 
+  const btn = $("mainLoginButton");
+  let originalText = "";
+  if (btn) {
+    originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Connecting...";
+  }
+
   try {
     const data = await api("/auth/login", {
       method: "POST",
@@ -179,6 +308,11 @@ async function unifiedLogin() {
     }
   } catch (error) {
     notify(error.message || "Invalid Email/Password.", "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
   }
 }
 
@@ -237,22 +371,7 @@ async function studentLogin() {
 }
 
 async function leaderApi(path, options = {}) {
-  let response;
-  try {
-    response = await fetch(API + path, {
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...((state.leaderToken || state.token) ? { Authorization: `Bearer ${state.leaderToken || state.token}` } : {}),
-        ...(options.headers || {})
-      }
-    });
-  } catch {
-    throw new Error("Backend is offline.");
-  }
-  const data = await response.json().catch(() => ({ message: "Invalid server response." }));
-  if (!response.ok) throw new Error(data.message || "Request failed.");
-  return data;
+  return request(path, options, true);
 }
 
 async function leaderLogin() {
@@ -2046,54 +2165,6 @@ function openChapter(index) {
   renderChapterList();
   renderChapter();
   window.scrollTo({top:0,behavior:"smooth"});
-  
-  completeChapterOnSidebarClick(index);
-}
-
-async function completeChapterOnSidebarClick(chapterIndex) {
-  if (state.publicMode) {
-    const key = `publicProgress:${state.currentProject.id}`;
-    const completed = JSON.parse(localStorage.getItem(key) || "[]");
-    if (!completed.includes(chapterIndex)) {
-      completed.push(chapterIndex);
-      localStorage.setItem(key, JSON.stringify(completed));
-      renderChapterList();
-    }
-    return;
-  }
-  if (!state.token) return;
-
-  const progress = state.user?.progress?.[state.currentProject.id] || {};
-  const completedChapters = progress.completedChapters || [];
-  if (completedChapters.includes(chapterIndex)) {
-    return;
-  }
-
-  // Optimistic UI updates
-  completedChapters.push(chapterIndex);
-  completedChapters.sort((a, b) => a - b);
-  const totalChapters = CHAPTERS.length;
-  const completedCount = completedChapters.length;
-  const percentComplete = Math.min(100, Math.round(completedCount / totalChapters * 100));
-  progress.percent = percentComplete;
-  
-  renderChapterList();
-
-  const progressFill = document.querySelector(".progress-track-fill");
-  if (progressFill) progressFill.style.width = `${percentComplete}%`;
-  const progressText = document.querySelector(".progress-summary-bar-box small");
-  if (progressText) progressText.textContent = `${percentComplete}% Complete`;
-  const progressCount = document.querySelector(".progress-summary-bar-box span b");
-  if (progressCount) progressCount.textContent = `${completedCount}/subproject ${totalChapters}`;
-
-  // Execute actual API calls asynchronously in the background
-  api(`/projects/${state.currentProject.id}/chapters/${chapterIndex}`, { method: "POST" })
-    .then(async () => {
-      await loadMe();
-    })
-    .catch(err => {
-      console.error("Error in background completion:", err);
-    });
 }
 
 function getDynamicDeepTheory(project, chapterName) {
@@ -3107,12 +3178,27 @@ window.handleZipSelection = function(input) {
   infoSpan.textContent = `${file.name} (${sizeMb.toFixed(2)} MB)`;
 };
 
+function validateAndNormalizeGithubUrl(url) {
+  if (typeof url !== "string") return null;
+  let cleanUrl = url.trim();
+  cleanUrl = cleanUrl.replace(/\/+$/, "");
+  if (cleanUrl.toLowerCase().endsWith(".git")) {
+    cleanUrl = cleanUrl.slice(0, -4);
+  }
+  const regex = /^https?:\/\/(www\.)?github\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/i;
+  if (!regex.test(cleanUrl)) {
+    return null;
+  }
+  return cleanUrl;
+}
+
 async function submitProject() {
   const githubUrl = $("githubUrl").value.trim();
   const submissionNote = $("submissionNote").value.trim();
   const zipInput = $("projectZipFile");
   
-  if (!/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+(\/.*)?$/i.test(githubUrl)) {
+  const normalizedUrl = validateAndNormalizeGithubUrl(githubUrl);
+  if (!normalizedUrl) {
     notify("Enter a valid GitHub repository URL.", "error");
     return;
   }
@@ -3139,7 +3225,7 @@ async function submitProject() {
   
   try {
     const formData = new FormData();
-    formData.append("githubUrl", githubUrl);
+    formData.append("githubUrl", normalizedUrl);
     formData.append("submissionNote", submissionNote);
     formData.append("projectZip", zipFile);
     
@@ -4473,6 +4559,29 @@ function renderStudentQuizPage() {
     const r = studentQuizResult;
     const isPassed = r.percentage >= 70;
     
+    const completed = state.user?.progress?.[p.id]?.completedChapters || [];
+    const isCompleted = completed.includes(state.currentChapter);
+    
+    let actionsHtml = `
+      <div class="chapter-actions" style="margin-top:20px;display:flex;gap:12px;justify-content:space-between">
+        <button class="btn outline" id="quizPrevChapter">← Previous</button>
+    `;
+    
+    if (isCompleted) {
+      actionsHtml += `
+        <button class="btn success" style="background:var(--green);color:#fff;cursor:default;opacity:0.9" disabled>✓ Chapter Completed</button>
+      `;
+    } else if (isPassed) {
+      actionsHtml += `
+        <button class="btn success" id="quizCompleteChapter">Mark Chapter Complete</button>
+      `;
+    }
+    
+    actionsHtml += `
+        <button class="btn primary" id="quizNextChapter">Next →</button>
+      </div>
+    `;
+    
     container.innerHTML = `
       <div style="padding:20px;background:var(--card);border:1px solid var(--border);border-radius:12px;">
         <h2 style="color:var(--navy)">🎉 Quiz Completed</h2>
@@ -4487,8 +4596,19 @@ function renderStudentQuizPage() {
             Status: ${isPassed ? 'Passed' : 'Failed (Required >= 70% to pass)'}
           </p>
         </div>
+        ${actionsHtml}
       </div>
     `;
+    
+    const prevBtn = $("quizPrevChapter");
+    if (prevBtn) prevBtn.onclick = () => openChapter(Math.max(0, state.currentChapter - 1));
+    
+    const nextBtn = $("quizNextChapter");
+    if (nextBtn) nextBtn.onclick = () => openChapter(Math.min(CHAPTERS.length - 1, state.currentChapter + 1));
+    
+    const compBtn = $("quizCompleteChapter");
+    if (compBtn) compBtn.onclick = completeChapter;
+    
     return;
   }
 
