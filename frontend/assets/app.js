@@ -82,7 +82,10 @@ async function request(path, options = {}, isLeader = false) {
       if (isTimeout) {
         throw new Error("Backend timeout: The server took too long to respond.");
       }
-      throw new Error("Unable to connect to the server. Please check your connection.");
+      const isHosted = API.includes("onrender.com");
+      throw new Error(isHosted 
+        ? "Unable to connect to the hosted server. The service may be suspended by the owner or temporarily unreachable."
+        : "Unable to connect to the local server. Please make sure the backend is running on port 5000.");
     }
 
     // Process Response
