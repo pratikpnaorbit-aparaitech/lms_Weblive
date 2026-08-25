@@ -21,8 +21,7 @@ const state = {
 let adminStudentsCache = [];
 
 async function request(path, options = {}, isLeader = false) {
-  const maxRetries = 5;
-  const retryDelay = 5000;
+  const maxRetries = 3;
   const timeoutMs = 60000;
   let attempt = 0;
 
@@ -58,22 +57,22 @@ async function request(path, options = {}, isLeader = false) {
       // Logging for login requests
       if (path.includes("/auth/login") || path.includes("/auth/student-login") || path.includes("/auth/leader-login")) {
         console.log(
-          `[LOGIN DEBUG]\n` +
-          `API Base URL: ${API}\n` +
-          `Login Endpoint: ${path}\n` +
-          `Full Request URL: ${fullUrl}\n` +
-          `HTTP Method: ${method}\n` +
-          `Request Started: ${new Date(start).toISOString()}\n` +
-          `Response Received: ${new Date().toISOString()}\n` +
-          `HTTP Status: ${isTimeout ? "Timeout" : "Network Error"}\n` +
+          `[API DEBUG] Base URL: ${API}\n` +
+          `Endpoint: ${path}\n` +
+          `Full URL: ${fullUrl}\n` +
+          `Method: ${method}\n` +
+          `Attempt: ${attempt + 1}\n` +
+          `Request Time: ${new Date(start).toISOString()}\n` +
+          `Response Time: ${new Date().toISOString()}\n` +
+          `HTTP Status: Network Error\n` +
           `Response Body: -\n` +
-          `Request Duration: ${duration}ms\n` +
           `Error Type: ${errorType} - ${err.message}`
         );
       }
 
       if (!isTimeout && attempt < maxRetries) {
         attempt++;
+        const retryDelay = Math.pow(2, attempt) * 1500; // Exponential Backoff: 3000ms, 6000ms, 12000ms
         console.warn(`[API] Network error. Retrying in ${retryDelay/1000}s... (Attempt ${attempt}/${maxRetries})`);
         updateLoginStatusUI(`Waking up server... (Attempt ${attempt}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
@@ -83,10 +82,10 @@ async function request(path, options = {}, isLeader = false) {
       if (isTimeout) {
         throw new Error("Backend timeout: The server took too long to respond.");
       }
-      throw new Error(`Connection failed. ${err.message || "Network issue."}`);
+      throw new Error("Unable to connect to the server. Please check your connection.");
     }
 
-    // Process Response (Not wrapped in general network try-catch block)
+    // Process Response
     clearTimeout(id);
     const duration = Date.now() - start;
 
@@ -99,19 +98,19 @@ async function request(path, options = {}, isLeader = false) {
       responseBodyText = "Non-JSON response";
     }
 
-    // Logging for login requests
+    // Logging for login requests (excluding passwords/tokens)
     if (path.includes("/auth/login") || path.includes("/auth/student-login") || path.includes("/auth/leader-login")) {
+      const sanitizedBodyText = responseBodyText.replace(/"token"\s*:\s*"[^"]*"/g, '"token":"[REDACTED]"');
       console.log(
-        `[LOGIN DEBUG]\n` +
-        `API Base URL: ${API}\n` +
-        `Login Endpoint: ${path}\n` +
-        `Full Request URL: ${fullUrl}\n` +
-        `HTTP Method: ${method}\n` +
-        `Request Started: ${new Date(start).toISOString()}\n` +
-        `Response Received: ${new Date().toISOString()}\n` +
+        `[API DEBUG] Base URL: ${API}\n` +
+        `Endpoint: ${path}\n` +
+        `Full URL: ${fullUrl}\n` +
+        `Method: ${method}\n` +
+        `Attempt: ${attempt + 1}\n` +
+        `Request Time: ${new Date(start).toISOString()}\n` +
+        `Response Time: ${new Date().toISOString()}\n` +
         `HTTP Status: ${response.status}\n` +
-        `Response Body: ${responseBodyText}\n` +
-        `Request Duration: ${duration}ms`
+        `Response Body: ${sanitizedBodyText}`
       );
     }
 
@@ -123,26 +122,33 @@ async function request(path, options = {}, isLeader = false) {
     if (response.status === 502 || response.status === 503 || response.status === 504) {
       if (attempt < maxRetries) {
         attempt++;
+        const retryDelay = Math.pow(2, attempt) * 1500; // Exponential Backoff: 3000ms, 6000ms, 12000ms
         console.warn(`[API] Temporary server error ${response.status}. Retrying in ${retryDelay/1000}s... (Attempt ${attempt}/${maxRetries})`);
         updateLoginStatusUI(`Waking up server... (Attempt ${attempt}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
         continue;
       }
+      if (response.status === 503) {
+        throw new Error("Server is temporarily unavailable. Please wait a moment and try again.");
+      }
       throw new Error(`Hosted backend is starting up or unreachable (HTTP ${response.status}). Please try again in a few seconds.`);
     }
 
     // Handle standard business errors (400, 401, 403, 404, 500)
+    if (response.status === 400) {
+      throw new Error(data.message || "Bad request (400).");
+    }
     if (response.status === 401) {
-      throw new Error(data.message || "Invalid credentials.");
+      throw new Error(data.message || "Invalid username or password.");
     }
     if (response.status === 403) {
       throw new Error("Access denied (403 Forbidden).");
     }
     if (response.status === 404) {
-      throw new Error("API endpoint configuration problem (404 Not Found).");
+      throw new Error("Requested API endpoint was not found.");
     }
     if (response.status === 500) {
-      throw new Error(data.message || "Internal Server Error (500).");
+      throw new Error(data.message || "Server error. Please try again later.");
     }
 
     throw new Error(data.message || `Request failed with status ${response.status}`);
@@ -3794,7 +3800,7 @@ window.addEventListener("beforeunload", () => {
 async function initApp() {
   initializeCameraWidget();
   window.checkBackendHealth();
-  await loadDomains();
+  loadDomains().catch(()=>{});
   const isLogged = Boolean(state.token || state.leaderToken);
   const role = state.role || (state.leaderToken ? "ADMIN" : (state.token ? "STUDENT" : ""));
 
@@ -4815,26 +4821,36 @@ window.downloadSubmissionZip = async function(studentId, projectId) {
   }
 };
 
+let isHealthChecking = false;
 window.checkBackendHealth = async function() {
+  if (isHealthChecking) return;
+  isHealthChecking = true;
   const statusSpan = $("backendStatus");
-  if (!statusSpan) return;
+  if (!statusSpan) {
+    isHealthChecking = false;
+    return;
+  }
   
   statusSpan.className = "status checking";
   statusSpan.textContent = "Connecting to server...";
   
   try {
-    const response = await fetch(API + "/projects", {
+    const response = await fetch(API + "/health", {
       method: "GET"
     });
     if (response.ok) {
       statusSpan.className = "status online";
       statusSpan.textContent = "Connected";
+      isHealthChecking = false;
     } else {
       throw new Error("Server offline");
     }
   } catch (err) {
     statusSpan.className = "status offline";
     statusSpan.textContent = "Offline / Waking up server...";
-    setTimeout(window.checkBackendHealth, 3000);
+    setTimeout(() => {
+      isHealthChecking = false;
+      window.checkBackendHealth();
+    }, 15000);
   }
 };
