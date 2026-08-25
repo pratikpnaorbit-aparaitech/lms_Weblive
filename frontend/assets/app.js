@@ -1,7 +1,44 @@
 
 "use strict";
 
-const API = "https://weblive-qvzp.onrender.com/api";
+let API = "http://localhost:5000/api";
+const LOCAL_API = "http://localhost:5000/api";
+const REMOTE_API = "https://weblive-qvzp.onrender.com/api";
+
+async function discoverBackend() {
+  const isLocalFrontend = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+  if (!isLocalFrontend) {
+    API = "/api";
+    console.log("[API] Hosted production frontend detected. Using relative API URL: /api");
+    return;
+  }
+
+  console.log("[API] Local frontend detected. Discovering active backend...");
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout
+    
+    const response = await fetch(LOCAL_API + "/health", {
+      method: "GET",
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok) {
+      API = LOCAL_API;
+      console.log(`[API] Local backend detected: ${LOCAL_API}`);
+      return;
+    }
+  } catch (err) {
+    // Local backend failed or timed out
+  }
+  
+  API = REMOTE_API;
+  console.log(`[API] Local backend unavailable. Using Render backend: ${REMOTE_API}`);
+}
+
 const $ = id => document.getElementById(id);
 const state = {
   token: localStorage.getItem("aprToken") || "",
@@ -82,7 +119,10 @@ async function request(path, options = {}, isLeader = false) {
       if (isTimeout) {
         throw new Error("Backend timeout: The server took too long to respond.");
       }
-      throw new Error("Unable to connect to the server. Please check your connection.");
+      const isHosted = API.includes("onrender.com");
+      throw new Error(isHosted 
+        ? "Unable to connect to the hosted server. The service may be suspended by the owner or temporarily unreachable."
+        : "Unable to connect to the local server. Please make sure the backend is running on port 5000.");
     }
 
     // Process Response
@@ -3799,6 +3839,7 @@ window.addEventListener("beforeunload", () => {
 
 async function initApp() {
   initializeCameraWidget();
+  await discoverBackend();
   window.checkBackendHealth();
   loadDomains().catch(()=>{});
   const isLogged = Boolean(state.token || state.leaderToken);
