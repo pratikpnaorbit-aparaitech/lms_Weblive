@@ -910,7 +910,23 @@ function normalizeUser(u){
 }
 
 app.get("/",(_,res)=>res.json({success:true,service:"Aparaitech Advanced Tracking Backend"}));
-app.get("/api/health",(_,res)=>res.json({success:true,status:"healthy",timestamp:new Date().toISOString()}));
+app.get("/api/health", (req, res) => {
+  const dbConnected = mongoose.connection.readyState === 1;
+  if (!dbConnected) {
+    return res.status(503).json({
+      success: false,
+      status: "unhealthy",
+      database: "disconnected",
+      timestamp: new Date().toISOString()
+    });
+  }
+  res.json({
+    success: true,
+    status: "healthy",
+    database: "connected",
+    timestamp: new Date().toISOString()
+  });
+});
 
 
 app.post("/api/auth/student-login",(req,res)=>{
